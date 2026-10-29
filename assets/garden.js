@@ -1,0 +1,389 @@
+// LAÇO garden runtime: one shared Hydra canvas per page, live code boxes,
+// pause / hide text, the links filter, and present mode on meetup pages.
+// Never asks for the camera or the microphone.
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("hydra-canvas");
+  const pauseButton = document.getElementById("pause-visuals");
+  const hideButton = document.getElementById("hide-text");
+
+  const store = {
+    get(key) {
+      try { return localStorage.getItem(key); } catch { return null; }
+    },
+    set(key, value) {
+      try { localStorage.setItem(key, value); } catch { /* private mode: fine */ }
+    },
+  };
+
+  // ---------- Hydra ----------
+
+  // Phones and small screens render at half resolution, like the main LAÇO site.
+  const scale = () => (Math.min(innerWidth, innerHeight) < 700 ? 0.5 : 1) * Math.min(devicePixelRatio || 1, 1.5);
+  const size = () => [Math.max(1, Math.round(innerWidth * scale())), Math.max(1, Math.round(innerHeight * scale()))];
+
+  let hydra = null;
+  let startError = "";
+  if (typeof Hydra === "undefined") {
+    startError = "The Hydra engine couldn't load. Check your internet connection and reload the page.";
+  } else {
+    try {
+      const [width, height] = size();
+      hydra = new Hydra({
+        canvas, width, height,
+        detectAudio: false, makeGlobal: true, autoLoop: false, enableStreamCapture: false,
+      });
+      // With our own canvas, Hydra keeps the default 300 × 150 size (blurry when stretched).
+      hydra.setResolution(width, height);
+    } catch (err) {
+      console.error(err);
+      startError = "Your browser couldn't start the visuals (WebGL isn't available).";
+    }
+  }
+
+  // The LAÇO title, drawn on a hidden 2D canvas the size of the Hydra canvas
+  // and loaded as s0 (the welcome sketch layers it on top).
+  const titleCanvas = document.createElement("canvas");
+  function drawTitle() {
+    const w = canvas.width;
+    const h = canvas.height;
+    titleCanvas.width = w;
+    titleCanvas.height = h;
+    const c = titleCanvas.getContext("2d");
+    const unit = Math.min(w / 7, h / 4.5);
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    c.fillStyle = "#fff";
+    c.shadowColor = "rgba(0, 0, 0, 0.9)";
+    c.shadowBlur = unit * 0.12;
+    c.shadowOffsetX = c.shadowOffsetY = unit * 0.03;
+    // Space Mono is wide: shrink a line if it would not fit the screen.
+    const line = (text, style, size, y) => {
+      c.font = `${style} ${size}px "Space Mono", monospace`;
+      const width = c.measureText(text).width;
+      if (width > w * 0.9) c.font = `${style} ${(size * w * 0.9) / width}px "Space Mono", monospace`;
+      c.fillText(text, w / 2, y);
+    };
+    line("LAÇO", "700", unit * 1.5, h / 2 - unit * 0.75);
+    line("<code to share>", "700", unit * 0.42, h / 2 + unit * 0.35);
+    line("welcome to the live coding meetup!", "italic 400", unit * 0.3, h / 2 + unit * 0.95);
+  }
+  const loadTitle = () => {
+    drawTitle();
+    s0.init({ src: titleCanvas, dynamic: false });
+  };
+
+  // ---------- Errors, in plain words, under the code box ----------
+
+  function explain(err) {
+    const text = String((err && err.message) || err || "Something went wrong.").split("\n")[0];
+    let m;
+    if (err && err.name === "SyntaxError") return `There's a typing mistake: ${text}. Check the commas, brackets and quotes.`;
+    if ((m = text.match(/^(\S+) is not defined/))) return `Hydra doesn't know “${m[1]}”. Check the spelling: names are case-sensitive.`;
+    if ((m = text.match(/(\w+) is not a function/))) return `“${m[1]}” can't be used here. Check the spelling, and that it comes after a source such as osc().`;
+    return text;
+  }
+
+  const setState = (box, text) => {
+    const state = box && box.querySelector(".sketch-state");
+    if (state) state.textContent = text;
+  };
+
+  function showError(box, message) {
+    if (!box) return;
+    const p = box.querySelector(".sketch-error");
+    p.textContent = message;
+    p.hidden = false;
+    box.classList.add("has-error");
+    setState(box, "");
+  }
+
+  function clearError(box) {
+    if (!box) return;
+    box.querySelector(".sketch-error").hidden = true;
+    box.classList.remove("has-error");
+  }
+
+  // Hydra catches errors that happen while drawing (e.g. inside an arrow function)
+  // and only warns in the console, every frame. Show them under the running box instead.
+  let activeBox = null;
+  let lastFrameError = "";
+  const consoleWarn = console.warn.bind(console);
+  console.warn = (...args) => {
+    const [first, detail] = args;
+    let message = "";
+    if (first === "ERROR" || (typeof first === "string" && first.startsWith("Error during tick"))) {
+      message = explain(detail);
+    } else if (first === "function does not return a number") {
+      message = "An arrow function has to give back a number.";
+    }
+    if (message) {
+      if (message === lastFrameError) return;   // the same error repeats every frame
+      lastFrameError = message;
+      showError(activeBox, message);
+    }
+    consoleWarn(...args);
+  };
+
+  // ---------- Running code ----------
+
+  let paused = false;
+
+  function markActive(box) {
+    document.querySelectorAll(".sketch.is-active").forEach((b) => {
+      b.classList.remove("is-active");
+      setState(b, "");
+    });
+    activeBox = box;
+    if (box) {
+      box.classList.add("is-active");
+      setState(box, paused ? "on screen · paused" : "on screen");
+    }
+  }
+
+  function run(code, box = null) {
+    clearError(box);
+    if (!hydra) {
+      showError(box, startError);
+      return;
+    }
+    try {
+      new Function(code); // syntax check first, so a typo doesn't blank the screen
+    } catch (err) {
+      showError(box, explain(err));
+      return;
+    }
+    lastFrameError = "";
+    try {
+      hush();
+      window.speed = 1;
+      loadTitle();
+      render(o0);
+      (0, eval)(code);
+    } catch (err) {
+      showError(box, explain(err));
+      return;
+    }
+    markActive(box);
+    if (paused) hydra.tick(16); // one still frame
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(now - last, 100);
+    last = now;
+    if (hydra && !paused) hydra.tick(dt);
+    requestAnimationFrame(frame);
+  }
+
+  let resizeTimer;
+  addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (!hydra) return;
+      setResolution(...size());
+      loadTitle();
+      if (paused) hydra.tick(0);
+    }, 150);
+  });
+
+  // ---------- Pause visuals / hide text ----------
+
+  function setPaused(value, remember) {
+    paused = value;
+    pauseButton.setAttribute("aria-pressed", String(paused));
+    pauseButton.textContent = paused ? "Play visuals" : "Pause visuals";
+    if (activeBox) setState(activeBox, paused ? "on screen · paused" : "on screen");
+    if (remember) store.set("laco-garden-paused", paused ? "1" : "0");
+  }
+
+  const savedPause = store.get("laco-garden-paused");
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  setPaused(savedPause === null ? reduceMotion : savedPause === "1", false);
+  pauseButton.addEventListener("click", () => setPaused(!paused, true));
+
+  hideButton.addEventListener("click", () => {
+    const hidden = document.body.classList.toggle("text-hidden");
+    hideButton.setAttribute("aria-pressed", String(hidden));
+    hideButton.textContent = hidden ? "Show text" : "Hide text";
+  });
+
+  // ---------- Code boxes ----------
+
+  const fit = (textarea) => { textarea.rows = Math.max(1, textarea.value.split("\n").length); };
+
+  function setupBox(box, original, onEdit) {
+    const code = box.querySelector(".sketch-code");
+    const go = () => run(code.value, box);
+    box.querySelector(".sketch-run").addEventListener("click", go);
+    box.querySelector(".sketch-reset").addEventListener("click", () => {
+      code.value = original();
+      fit(code);
+      if (onEdit) onEdit(null);
+      go();
+    });
+    code.addEventListener("input", () => {
+      fit(code);
+      if (onEdit) onEdit(code.value);
+    });
+    code.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        go();
+      }
+    });
+  }
+
+  document.querySelectorAll(".page [data-sketch]").forEach((box) => {
+    const original = box.querySelector(".sketch-code").value;
+    setupBox(box, () => original);
+  });
+
+  if (startError) {
+    const notice = document.createElement("p");
+    notice.className = "notice";
+    notice.textContent = startError;
+    document.querySelector(".page").prepend(notice);
+  }
+
+  // ---------- Filters (garden and links) ----------
+
+  const filters = document.querySelector(".filters");
+  if (filters) {
+    filters.addEventListener("click", (e) => {
+      const button = e.target.closest("button[data-filter]");
+      if (!button) return;
+      const value = button.dataset.filter;
+      filters.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+      document.querySelectorAll(".page [data-tags]").forEach((card) => {
+        card.hidden = value !== "all" && !card.dataset.tags.split(" ").includes(value);
+      });
+    });
+  }
+
+  // ---------- Present mode (meetup pages) ----------
+
+  function setupPresent(slides) {
+    const overlay = document.getElementById("present");
+    const $ = (selector) => overlay.querySelector(selector);
+    const box = $(".present-sketch");
+    const code = box.querySelector(".sketch-code");
+    const edits = [];
+    let index = 0;
+
+    setupBox(box, () => slides[index].code, (value) => { edits[index] = value; });
+
+    const setUrl = (value) => {
+      const url = new URL(location.href);
+      if (value === null) url.searchParams.delete("present");
+      else url.searchParams.set("present", value);
+      history.replaceState(null, "", url);
+    };
+
+    function show(i) {
+      index = Math.max(0, Math.min(slides.length - 1, i));
+      const slide = slides[index];
+      $(".present-count").textContent = `${index + 1} / ${slides.length}`;
+      $(".present-kind").hidden = !slide.kind;
+      $(".present-kind .label").textContent = slide.kind || "";
+      $(".present-title").innerHTML = slide.titleHtml;   // built from our own content at build time
+      $(".present-summary").innerHTML = slide.summaryHtml;
+      const open = $(".present-open");
+      open.hidden = !slide.href;
+      if (slide.href) open.href = slide.href;
+      box.hidden = !slide.code;
+      if (slide.code) {
+        code.value = edits[index] ?? slide.code;
+        fit(code);
+        run(code.value, box);
+      }
+      setUrl(index + 1);
+    }
+
+    function enter(i) {
+      overlay.hidden = false;
+      document.body.classList.add("presenting");
+      show(i);
+      $(".present-next").focus();
+    }
+
+    function exit() {
+      overlay.hidden = true;
+      overlay.classList.remove("slide-hidden");
+      document.body.classList.remove("presenting");
+      setUrl(null);
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    }
+
+    function toggleFullscreen() {
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+      else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {});
+    }
+
+    document.addEventListener("click", (e) => {
+      const start = e.target.closest("[data-present-from]");
+      if (start) enter(Number(start.dataset.presentFrom));
+    });
+    $(".present-prev").addEventListener("click", () => show(index - 1));
+    $(".present-next").addEventListener("click", () => show(index + 1));
+    $(".present-exit").addEventListener("click", exit);
+
+    document.addEventListener("keydown", (e) => {
+      const typing = e.target.closest && e.target.closest("textarea, input, select, [contenteditable]");
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (overlay.hidden) {
+        if (!typing && e.key.toLowerCase() === "p") {
+          e.preventDefault();
+          enter(0);
+        }
+        return;
+      }
+      if (typing) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          e.target.blur();
+        }
+        return;
+      }
+      const key = e.key.toLowerCase();
+      if (key === "arrowright" || key === "pagedown") show(index + 1);
+      else if (key === "arrowleft" || key === "pageup") show(index - 1);
+      else if (key === "f") toggleFullscreen();
+      else if (key === "h") overlay.classList.toggle("slide-hidden");
+      else if (key === "escape") exit();
+      else return;
+      e.preventDefault();
+    });
+
+    const start = Number(new URLSearchParams(location.search).get("present"));
+    if (start >= 1) {
+      enter(start - 1);
+      return true;
+    }
+    return false;
+  }
+
+  // ---------- Start ----------
+
+  const trailData = document.getElementById("trail-data");
+  const presenting = trailData ? setupPresent(JSON.parse(trailData.textContent)) : false;
+
+  if (!presenting) {
+    const first = document.querySelector(".page [data-sketch][data-autorun]");
+    if (first) run(first.querySelector(".sketch-code").value, first);
+    else if (document.body.dataset.ambient) run(document.body.dataset.ambient);
+  }
+
+  // Redraw the title once the fonts have arrived.
+  if (hydra && document.fonts) {
+    Promise.all(['700 40px "Space Mono"', 'italic 400 40px "Space Mono"'].map((f) => document.fonts.load(f)))
+      .then(() => {
+        loadTitle();
+        if (paused) hydra.tick(0);
+      })
+      .catch(() => {});
+  }
+
+  requestAnimationFrame(frame);
+})();
